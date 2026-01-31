@@ -101,8 +101,7 @@ PyJWT==2.8.0
 python-dateutil==2.8.2
 python-editor==1.0.4
 python-multipart==0.0.6
-pytorch-lightning==2.0.6
-pytorch-triton==2.1.0+e6216047b8
+pytorch-lightning<=2.0.6
 pytz==2023.3
 PyYAML==6.0.1
 rapidfuzz==2.13.7
@@ -127,12 +126,10 @@ termcolor==2.3.0
 thop==0.1.1.post2209072238
 tiktoken==0.4.0
 tokenizers==0.13.3
-torch==2.1.0.dev20230824+cu118
 torchmetrics==1.0.1
 tqdm==4.65.0
 traitlets==5.9.0
 transformers==4.31.0
-triton==2.0.0
 typeshed-client==2.3.0
 typing_extensions==4.7.1
 tzdata==2023.3
