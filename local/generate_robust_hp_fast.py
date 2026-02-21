@@ -1,6 +1,8 @@
 import whisper
 import re
 import sys
+sys.path.append(".")
+
 import os, random, copy
 import numpy as np
 import torch
@@ -22,10 +24,11 @@ from sentencepiece import SentencePieceProcessor, SentencePieceTrainer
 from sentence_transformers import SentenceTransformer
 from argparse import ArgumentParser
 from evaluate import load
-from litgpt.tokenizer import Tokenizer
+from lit_gpt.tokenizer import Tokenizer
 from tqdm import tqdm
 import time
 import argparse
+
 
 print(whisper.__path__)
 
@@ -93,6 +96,46 @@ def atomic_json_save(obj, path: str):
         json.dump(obj, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, path)
 
+
+# -----------------------------
+# Whisper padding-free features
+# -----------------------------
+# Whisper uses 16kHz audio, hop_length=160 (10ms) -> max 3000 mel frames for 30s.
+# Encoder time steps are approximately ceil(mel_frames/2) with max 1500.
+
+
+def compute_whisper_mel_enc_len_from_n16(n_samples_16k: int) -> tuple[int, int]:
+    """Compute (mel_len, enc_len) for Whisper given raw 16k-sample length.
+
+    - mel_len is capped at 3000 (30s)
+    - enc_len is capped at 1500
+    """
+    hop = 160
+    mel_len = (int(n_samples_16k) + hop - 1) // hop  # ceil
+    mel_len = min(mel_len, 3000)
+    enc_len = (mel_len + 1) // 2  # ceil(mel/2)
+    enc_len = min(enc_len, 1500)
+    enc_len = max(enc_len, 1)
+    return int(mel_len), int(enc_len)
+
+
+def slice_whisper_time_axis(feat: torch.Tensor, enc_len: int) -> torch.Tensor:
+    """Slice Whisper encoder features to `enc_len` time steps.
+
+    Supports:
+      - [T, D]
+      - [1, T, D]
+    """
+    if feat is None:
+        return feat
+    if not torch.is_tensor(feat):
+        return feat
+    if feat.dim() == 3 and feat.size(0) == 1:
+        return feat[:, :enc_len, :].contiguous()
+    if feat.dim() == 2:
+        return feat[:enc_len, :].contiguous()
+    return feat
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--noisy_wavscp", default="dump/raw/ihm_train_sp/wav.scp", type=str)
 parser.add_argument("--clean_wavscp", default="dump/raw/ihm_train_sp/wav.scp", type=str)
@@ -158,8 +201,9 @@ if args.resume and os.path.exists(state_path):
         print(f"[WARN] state meta mismatch, restart from 0")
 
 start_index = max(0, min(start_index, len(uttid_list)))
+options = whisper.DecodingOptions(language='en', beam_size=50)
 
-with torch.no_grad():
+with torch.inference_mode():
     for idx in tqdm(range(start_index, len(uttid_list)), total=len(uttid_list) - start_index):
         utt_id = uttid_list[idx]
         audio_path = noisy_wav_dict[utt_id]
@@ -167,148 +211,139 @@ with torch.no_grad():
         print(utt_id, clean_utt_id)
         clean_audio_path = clean_wav_dict[clean_utt_id]
         
-        gt = text_dict[clean_utt_id]
-        
-        start = time.perf_counter()
-        audio = whisper.load_audio(audio_path)
-        
-        audio = whisper.pad_or_trim(audio)                # padding to 30s
-        end = time.perf_counter()
-        print(f"Load Audio and Padding {end - start}")
-        
-        start = time.perf_counter() 
-        mel = whisper.log_mel_spectrogram(audio).to(model.device)
-        end = time.perf_counter()
-        print(f"Mel spectrogram {end - start}")
-
-        start = time.perf_counter() 
-        options = whisper.DecodingOptions(language='en', beam_size=50)
-        texts, confidences = whisper.decode_score(model, mel, options)
-        end = time.perf_counter()
-        print(f"Decoding {end - start}")
-
-        start = time.perf_counter() 
-        ## noisy audio feats
-        audio_features = model.encoder(mel.unsqueeze(0))[0].to("cpu").detach()
-        
-        end = time.perf_counter()
-        print(f"Audio Feats {end - start}")
-
-        start = time.perf_counter() 
-        
-        ## clean audio feats
-        clean_audio = whisper.load_audio(clean_audio_path)
-        clean_audio = whisper.pad_or_trim(clean_audio)                # padding to 30s
-        # clean_audio = whisper.pad_or_trim(clean_audio)    # padding to 30s
-        clean_mel = whisper.log_mel_spectrogram(clean_audio).to(model.device)
-        clean_audio_features = model.encoder(clean_mel.unsqueeze(0))[0].to("cpu").detach()
-        
-        end = time.perf_counter()
-        print(f"Clean Decoding & Encoder {end - start}")
-
-        start = time.perf_counter()
-        input, score = [], []
-        for text, confidence in zip(texts, confidences):
-            if len(input) < 5 and len(text) > 0 and text not in input:
-                input.append(text)
-                score.append(confidence)
-        end = time.perf_counter()
-        print(f"Text confidence {end - start}")
-
-        start = time.perf_counter()
-        if len(input) < 5:
-            options = whisper.DecodingOptions(language='en', temperature=1.2)
-            for _ in range(5 - len(input)):
-                result = whisper.decode(model, mel, options)
-                text, condidence = result.text, result.avg_logprob
-                if text in input:
-                    continue
-                inserted = False
-                for i in range(len(input)):
-                    if condidence > score[i]:
-                        input.insert(i, text)
-                        score.insert(i, condidence)
-                        inserted = True
-                        break
-                if not inserted:
-                    input.append(text)
-                    score.append(condidence)
-        end = time.perf_counter()
-        print(f"Whisper decoding {end - start}")
-
-        start = time.perf_counter()
-        if len(input) < 5:
-            num_to_add = 5 - len(input)
-            for _ in range(num_to_add):
-                rand_id = random.randint(0, len(input) - 1)
-                rep_input, rep_score = copy.deepcopy(input[rand_id]), copy.deepcopy(score[rand_id])
-                input.insert(rand_id + 1, rep_input)
-                score.insert(rand_id + 1, rep_score)
-        end = time.perf_counter()
-        print(f"Rep_input {end - start}")
-
-        start = time.perf_counter()
-        for i in range(len(input)):
-            try:
-                text = normalizer(input[i])
-                text = re.sub(r"[-+]?\d*\.?\d+|\d+%?", lambda m: num2words(m.group()), text).replace('%', ' percent')
-            except Exception:
-                text = normalizer(input[i])
-                print(f'input exception: {text}')
-            input[i] = text if len(text) > 0 else '<UNK>'
-        end = time.perf_counter()
-        print(f"Normalizer {end - start}")
-
-        start = time.perf_counter()
         try:
-            output = normalizer(gt)
-            output = re.sub(r"[-+]?\d*\.?\d+|\d+%?", lambda m: num2words(m.group()), output).replace('%', ' percent')
-        except Exception:
-            output = normalizer(gt)
-            print(f'output exception: {output}')
-        output = output if len(output) > 0 else '<UNK>'
+            gt = text_dict[clean_utt_id]
 
-        cur_wer = calculate_wer([input[0]], [output])
-        end = time.perf_counter()
-        print(f"WER {end - start}")
+            # -----------------------------
+            # No padding on stored features
+            # -----------------------------
+            # We still run Whisper with 30s pad/trim, but slice encoder features back to the
+            # *effective* length computed from raw waveform length.
+            audio_raw = whisper.load_audio(audio_path)
+            audio_mel_len, audio_enc_len = compute_whisper_mel_enc_len_from_n16(len(audio_raw))
+            audio = whisper.pad_or_trim(audio_raw)  # Whisper expects 30s for fixed-shape mel
+            mel = whisper.log_mel_spectrogram(audio).to(model.device)
 
-        start = time.perf_counter()
-        # calculate emb diff
-        we_diffs, se_diffs = [], []
-        for i in range(5):
-            for j in range(i + 1, 5):
-                we_diffs.append(word_emb_diff(input[i], input[j]))
-                se_diffs.append(sent_emb_diff(input[i], input[j]))
+            texts, confidences, audio_features = whisper.decode_score(model, mel, options)
+            audio_features = audio_features.to("cpu").detach()
+            audio_features = slice_whisper_time_axis(audio_features, audio_enc_len)
 
-        we_diff = torch.stack(we_diffs, dim=0)      # [10, 384]
-        se_diff = torch.stack(se_diffs, dim=0)      # [10, 384]
-        emb_diff = torch.cat([we_diff, se_diff], dim=0)     # [20, 384]
-        end = time.perf_counter()
-        print(f"WE SE {end - start}")
-        
-        start = time.perf_counter()        
-        # generate ids
-        input1 = input[0] + '.'
-        input2 = '. '.join(input[1:]) + '.'
+            # clean audio feats
+            clean_raw = whisper.load_audio(clean_audio_path)
+            clean_mel_len, clean_enc_len = compute_whisper_mel_enc_len_from_n16(len(clean_raw))
+            clean_audio = whisper.pad_or_trim(clean_raw)
+            clean_mel = whisper.log_mel_spectrogram(clean_audio).to(model.device)
+            clean_audio_features = model.encoder(clean_mel.unsqueeze(0))[0].to("cpu").detach()
+            clean_audio_features = slice_whisper_time_axis(clean_audio_features, clean_enc_len)
 
-        full_prompt = generate_prompt(input1, input2)
-        full_prompt_and_response = full_prompt + output
-        encoded_full_prompt = tokenizer.encode(full_prompt, max_length=1024)
-        encoded_full_prompt_and_response = tokenizer.encode(full_prompt_and_response, eos=True, max_length=1024)
-        end = time.perf_counter()
-        print(f"Prompt Generated {end - start}")
-        input()
+            input, score = [], []
+            for text, confidence in zip(texts, confidences):
+                if len(input) < 5 and len(text) > 0 and text not in input:
+                    input.append(text)
+                    score.append(confidence)
+            
+            if len(input) < 5:
+                options = whisper.DecodingOptions(language='en', temperature=1.2)
+                for _ in range(5 - len(input)):
+                    result = whisper.decode(model, mel, options)
+                    text, condidence = result.text, result.avg_logprob
+                    if text in input:
+                        continue
+                    inserted = False
+                    for i in range(len(input)):
+                        if condidence > score[i]:
+                            input.insert(i, text)
+                            score.insert(i, condidence)
+                            inserted = True
+                            break
+                    if not inserted:
+                        input.append(text)
+                        score.append(condidence)
 
-        labels = encoded_full_prompt_and_response.clone()
-        labels[: len(encoded_full_prompt)] = -1
+            if len(input) < 5:
+                num_to_add = 5 - len(input)
+                for _ in range(num_to_add):
+                    rand_id = random.randint(0, len(input) - 1)
+                    rep_input, rep_score = copy.deepcopy(input[rand_id]), copy.deepcopy(score[rand_id])
+                    input.insert(rand_id + 1, rep_input)
+                    score.insert(rand_id + 1, rep_score)
+
+            for i in range(len(input)):
+                try:
+                    text = normalizer(input[i])
+                    text = re.sub(r"[-+]?\d*\.?\d+|\d+%?", lambda m: num2words(m.group()), text).replace('%', ' percent')
+                except Exception:
+                    text = normalizer(input[i])
+                    print(f'input exception: {text}')
+                input[i] = text if len(text) > 0 else '<UNK>'
+                
+            try:
+                output = normalizer(gt)
+                output = re.sub(r"[-+]?\d*\.?\d+|\d+%?", lambda m: num2words(m.group()), output).replace('%', ' percent')
+            except Exception:
+                output = normalizer(gt)
+                print(f'output exception: {output}')
+            output = output if len(output) > 0 else '<UNK>'
+
+            cur_wer = calculate_wer([input[0]], [output])
+
+            # calculate emb diff
+            we_diffs, se_diffs = [], []
+            for i in range(5):
+                for j in range(i + 1, 5):
+                    we_diffs.append(word_emb_diff(input[i], input[j]))
+                    se_diffs.append(sent_emb_diff(input[i], input[j]))
+
+            we_diff = torch.stack(we_diffs, dim=0)      # [10, 384]
+            se_diff = torch.stack(se_diffs, dim=0)      # [10, 384]
+            emb_diff = torch.cat([we_diff, se_diff], dim=0)     # [20, 384]
+
+            # generate ids
+            input1 = input[0] + '.'
+            input2 = '. '.join(input[1:]) + '.'
+
+            full_prompt = generate_prompt(input1, input2)
+            full_prompt_and_response = full_prompt + output
+            encoded_full_prompt = tokenizer.encode(full_prompt, max_length=1024)
+            encoded_full_prompt_and_response = tokenizer.encode(full_prompt_and_response, eos=True, max_length=1024)
+            
+
+            labels = encoded_full_prompt_and_response.clone()
+            labels[: len(encoded_full_prompt)] = -1
 
 
-        data = {"id": utt_id, "input_ids": encoded_full_prompt_and_response, "input_ids_no_response": encoded_full_prompt, "labels": labels,
-                "input": input, 'ground_truth': output, "am_score": score, 'emb_diff': emb_diff, 'audio_features': audio_features, 
-                'clean_audio_features': clean_audio_features}
+            data = {
+                "id": utt_id,
+                "input_ids": encoded_full_prompt_and_response,
+                "input_ids_no_response": encoded_full_prompt,
+                "labels": labels,
+                "input": input,
+                "ground_truth": output,
+                "am_score": score,
+                "emb_diff": emb_diff,
+                "audio_features": audio_features,
+                "clean_audio_features": clean_audio_features,
+                # length metadata (optional but useful)
+                "audio_mel_len": int(audio_mel_len),
+                "audio_enc_len": int(audio_enc_len),
+                "clean_audio_mel_len": int(clean_mel_len),
+                "clean_audio_enc_len": int(clean_enc_len),
+            }
+            # calculate wer
+            idx += 1
+            print(f'utterance {idx}: wer = {cur_wer}, confidence = {score[0]}')
+            all_hypo.append(input[0])
+            all_refer.append(output)
+            pt_file.append(data)
+            del mel, clean_mel, audio, clean_audio
+        except:
+            idx += 1
+            data = {"id": utt_id, "input_ids": None, "input_ids_no_response": None, "labels": None,
+                    "input": None, 'ground_truth': None, "am_score": None, 'emb_diff': None, 'audio_features': None, 
+                    'clean_audio_features': None}
+            print(f"utterance {utt_id}: Something went wrong.")
+            pt_file.append(data)
 
-        pt_file.append(data)
-        del mel, clean_mel, audio, clean_audio
 
         if args.save_every and args.save_every > 0 and len(pt_file) >= args.save_every:
             chunk_path = f"{args.output_path}.chunk{chunk_id:06d}.pt"
@@ -318,12 +353,6 @@ with torch.no_grad():
 
             state = {"next_index": idx + 1, "chunk_id": chunk_id, "meta": meta}
             atomic_json_save(state, state_path)
-
-        # calculate wer
-        idx += 1
-        print(f'utterance {idx}: wer = {cur_wer}, confidence = {score[0]}')
-        all_hypo.append(input[0])
-        all_refer.append(output)
 
 
 if args.save_every and args.save_every > 0:
@@ -338,6 +367,7 @@ if args.save_every and args.save_every > 0:
 else:
     torch.save(pt_file, args.output_path)
 
-all_wer = calculate_wer(all_hypo, all_refer)
-print(f'all wer = {all_wer}')
+if len(all_hypo) > 0 and len(all_refer) > 0:
+    all_wer = calculate_wer(all_hypo, all_refer)
+    print(f'all wer = {all_wer}')
 
