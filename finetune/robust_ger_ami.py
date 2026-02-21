@@ -2,6 +2,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 import lightning as L
@@ -59,40 +60,6 @@ batch_size = 32 // devices  # trained atis with 32BS 1 gpu == 64BS with 2 GPUs
 micro_batch_size = 4  # was 6 with 500
 gradient_accumulation_iters = batch_size // micro_batch_size
 
-def _chunk_sort_key(p: str) -> int:
-    # e.g. ihm_train.pt.chunk0000007.pt
-    m = re.search(r"chunk(\d+)", os.path.basename(p))
-    return int(m.group(1)) if m else 10**18
-
-def load_pt_folder_all(path: str, map_location="cpu"):
-    """If path is a folder, load all *.pt under it and concat into one Python list."""
-    if not os.path.isdir(path):
-        return torch.load(path, map_location=map_location)
-
-    shard_paths = glob.glob(os.path.join(path, "*.pt"))
-    shard_paths = sorted(shard_paths, key=_chunk_sort_key)
-    if len(shard_paths) == 0:
-        raise FileNotFoundError(f"No .pt files found under: {path}")
-
-    data = []
-    for sp in shard_paths:
-        obj = torch.load(sp, map_location=map_location)
-        if isinstance(obj, list):
-            data.extend(obj)
-        else:
-            # 如果你每個 chunk 存的不是 list，而是 dict/tensor
-            data.append(obj)
-    return data
-
-
-train_data = load_pt_folder_all(train_path)#, map_location=torch.device('cpu'))
-val_data = load_pt_folder_all(val_path)#, map_location=torch.device('cpu'))
-
-
-# -----------------------------------------------------------------------------
-# (A) Filter out broken samples early (e.g., exception placeholders with None)
-# -----------------------------------------------------------------------------
-
 def _is_valid_sample_for_training(d: Dict) -> Tuple[bool, str]:
     """Return (ok, reason). Keep this conservative to prevent random crashes."""
     if d is None or not isinstance(d, dict):
@@ -116,30 +83,116 @@ def _is_valid_sample_for_training(d: Dict) -> Tuple[bool, str]:
     return True, ""
 
 
-def _filter_dataset(data: List[Dict], name: str) -> List[Dict]:
-    kept: List[Dict] = []
-    dropped = 0
-    reasons: Dict[str, int] = {}
-    for d in data:
-        ok, reason = _is_valid_sample_for_training(d)
-        if ok:
-            kept.append(d)
+def _chunk_sort_key(p: str) -> int:
+    # e.g. ihm_train.pt.chunk0000007.pt
+    m = re.search(r"chunk(\d+)", os.path.basename(p))
+    return int(m.group(1)) if m else 10**18
+
+
+class IndexedPTDataset:
+    """Memory-efficient, shard-indexed view of pt data.
+
+    - Build metadata by scanning shards once (streaming, CPU).
+    - Keep only valid sample indices, not full tensors.
+    - Load shard tensors on demand with a small LRU cache.
+    """
+
+    def __init__(self, path: str, name: str, map_location: str = "cpu", cache_size: int = 2):
+        self.path = path
+        self.name = name
+        self.map_location = map_location
+        self.cache_size = cache_size
+
+        if os.path.isdir(path):
+            shard_paths = sorted(glob.glob(os.path.join(path, "*.pt")), key=_chunk_sort_key)
+            if len(shard_paths) == 0:
+                raise FileNotFoundError(f"No .pt files found under: {path}")
+            self.shard_paths = shard_paths
         else:
-            dropped += 1
-            reasons[reason] = reasons.get(reason, 0) + 1
+            self.shard_paths = [path]
 
-    if dropped > 0:
-        print(f"[DATA] {name}: dropped {dropped}/{len(data)} broken samples")
-        # Print top reasons (small summary)
-        for r, c in sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:10]:
-            print(f"  - {r}: {c}")
-    else:
-        print(f"[DATA] {name}: no broken samples detected")
-    return kept
+        self._valid_local_indices: List[List[int]] = []
+        self._global_to_local: List[Tuple[int, int]] = []
+        self._shard_cache: OrderedDict[int, List[Dict]] = OrderedDict()
+
+        self._total_seq_len = 0
+        self._max_seq_len = 0
+        self._longest_seq_ix = 0
+        self._dropped = 0
+        self._reasons: Dict[str, int] = {}
+
+        self._build_index()
+
+    def _load_shard_data(self, shard_idx: int) -> List[Dict]:
+        if shard_idx in self._shard_cache:
+            self._shard_cache.move_to_end(shard_idx)
+            return self._shard_cache[shard_idx]
+
+        obj = torch.load(self.shard_paths[shard_idx], map_location=self.map_location)
+        data = obj if isinstance(obj, list) else [obj]
+
+        self._shard_cache[shard_idx] = data
+        if len(self._shard_cache) > self.cache_size:
+            self._shard_cache.popitem(last=False)
+        return data
+
+    def _build_index(self) -> None:
+        total_raw = 0
+        for shard_idx, shard_path in enumerate(self.shard_paths):
+            obj = torch.load(shard_path, map_location=self.map_location)
+            shard = obj if isinstance(obj, list) else [obj]
+            valid_local_indices: List[int] = []
+
+            for local_ix, sample in enumerate(shard):
+                total_raw += 1
+                ok, reason = _is_valid_sample_for_training(sample)
+                if not ok:
+                    self._dropped += 1
+                    self._reasons[reason] = self._reasons.get(reason, 0) + 1
+                    continue
+
+                global_ix = len(self._global_to_local)
+                valid_pos = len(valid_local_indices)
+                valid_local_indices.append(local_ix)
+                self._global_to_local.append((shard_idx, valid_pos))
+
+                seq_len = len(sample["input_ids"])
+                self._total_seq_len += seq_len
+                if seq_len > self._max_seq_len:
+                    self._max_seq_len = seq_len
+                    self._longest_seq_ix = global_ix
+
+            self._valid_local_indices.append(valid_local_indices)
+
+            del shard
+            gc.collect()
+
+        kept = len(self._global_to_local)
+        if self._dropped > 0:
+            print(f"[DATA] {self.name}: dropped {self._dropped}/{total_raw} broken samples")
+            for r, c in sorted(self._reasons.items(), key=lambda x: x[1], reverse=True)[:10]:
+                print(f"  - {r}: {c}")
+        else:
+            print(f"[DATA] {self.name}: no broken samples detected")
+        print(f"[DATA] {self.name}: kept {kept} samples from {len(self.shard_paths)} shard(s)")
+
+    def __len__(self) -> int:
+        return len(self._global_to_local)
+
+    def __getitem__(self, idx: int) -> Dict:
+        shard_idx, valid_pos = self._global_to_local[idx]
+        local_ix = self._valid_local_indices[shard_idx][valid_pos]
+        shard = self._load_shard_data(shard_idx)
+        return shard[local_ix]
+
+    def seq_length_stats(self) -> Tuple[float, int, int]:
+        if len(self) == 0:
+            return 0.0, 0, 0
+        return self._total_seq_len / len(self), self._max_seq_len, self._longest_seq_ix
 
 
-train_data = _filter_dataset(train_data, "train")
-val_data = _filter_dataset(val_data, "val")
+train_data = IndexedPTDataset(train_path, name="train")
+val_data = IndexedPTDataset(val_path, name="val")
 
 train_data_len = len(train_data)
 val_data_len = len(val_data)
@@ -273,8 +326,8 @@ def train(
     optimizer: torch.optim.Optimizer,
     mine,
     optimizer_m: torch.optim.Optimizer,
-    train_data: List[Dict],
-    val_data: List[Dict],
+    train_data,
+    val_data,
     checkpoint_dir: Path,
     out_dir: Path,
     speed_monitor: SpeedMonitor,
@@ -431,7 +484,7 @@ def train(
 
 @torch.no_grad()
 def validate(
-    fabric: L.Fabric, model: GPT, val_data: List[Dict], tokenizer: Tokenizer, longest_seq_length: int
+    fabric: L.Fabric, model: GPT, val_data, tokenizer: Tokenizer, longest_seq_length: int
 ) -> torch.Tensor:
     fabric.print("Validating ...")
     model.eval()
@@ -450,7 +503,7 @@ def validate(
 
 
 def get_batch(
-    fabric: L.Fabric, model, data: List[Dict], longest_seq_length: int, longest_seq_ix: Optional[int] = None
+    fabric: L.Fabric, model, data, longest_seq_length: int, longest_seq_ix: Optional[int] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     ix = torch.randint(len(data), (micro_batch_size,))
     if longest_seq_ix is not None:
@@ -481,7 +534,7 @@ def get_batch(
 
 
 def get_batch_para(
-        fabric: L.Fabric, model, data: List[Dict], longest_seq_length: int, longest_seq_ix: Optional[int] = None
+        fabric: L.Fabric, model, data, longest_seq_length: int, longest_seq_ix: Optional[int] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     ix = torch.randint(len(data), (micro_batch_size,))
     if longest_seq_ix is not None:
@@ -564,12 +617,17 @@ def get_batch_para(
     return x, y, ef, af, c_af, audio_lens, clean_audio_lens, audio_pooled, clean_audio_pooled
 
 
-def get_max_seq_length(data: List[Dict]) -> Tuple[int, int, int]:
+def get_max_seq_length(data) -> Tuple[int, int, int]:
     # find out the minimum max_seq_length required during fine-tuning (saves memory!)
-    lengths = [len(d["input_ids"]) for d in data]
-    print(f'mean length = {sum(lengths) / len(lengths)}')
-    max_seq_length = max(lengths)
-    longest_seq_ix = lengths.index(max_seq_length)
+    if hasattr(data, "seq_length_stats"):
+        mean_length, max_seq_length, longest_seq_ix = data.seq_length_stats()
+    else:
+        lengths = [len(d["input_ids"]) for d in data]
+        mean_length = sum(lengths) / len(lengths)
+        max_seq_length = max(lengths)
+        longest_seq_ix = lengths.index(max_seq_length)
+
+    print(f'mean length = {mean_length}')
     # support easy override at the top of the file
     return (
         override_max_seq_length if isinstance(override_max_seq_length, int) else max_seq_length,
